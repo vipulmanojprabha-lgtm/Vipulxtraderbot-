@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sqlite3
@@ -30,11 +31,12 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "6054005253"))
+PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = "bot_data.db"
 
 DEFAULT_SETTINGS = {
     "channel_id": "",
-    "auto_approve": "off",  # "on" या "off"
+    "auto_approve": "off",  # "on" ya "off"
     "register_url": "https://www.khelv19.com/#/register?invitationCode=89414517627",
     "panel_url": "https://example.com/panel",
     "rejoin_url": "https://t.me/Myselfvipulkumar",
@@ -161,15 +163,6 @@ def record_user(user) -> None:
     conn.close()
 
 
-def is_known_user(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM known_users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
 def get_all_slots() -> list[tuple[int, str]]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -280,13 +273,16 @@ def format_settings_status() -> str:
 
 def format_start_info(user_id: int) -> str:
     role_text = "Admin / Owner" if is_admin(user_id) else "Member"
-    extra_tip = "\n\nSettings badalne ke liye `/settings` likh kar bhejein." if is_admin(user_id) else ""
+    extra_tip = (
+        "\n\nSettings badalne ke liye `/settings` likh kar bhejein."
+        if is_admin(user_id)
+        else ""
+    )
     return (
-        f"🔵 **VIPUL X TRADER BOT**\n\n"
-        f"• **Status:** Active\n"
+        "🔵 **VIPUL X TRADER BOT**\n\n"
+        "• **Status:** Active\n"
         f"• **Role:** {role_text}\n"
-        "• **Auto Approval:** "
-        f"{get_setting('auto_approve').upper()}\n\n"
+        f"• **Auto Approval:** {get_setting('auto_approve').upper()}\n\n"
         "Neeche diye gaye **Blue Bottom Buttons** ka use karein."
         f"{extra_tip}"
     )
@@ -437,7 +433,6 @@ async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TY
     if not text_val:
         return
 
-    # पहले Admin/Owner की पेंडिंग सेटिंग इनपुट जांचें
     if is_admin(user.id):
         awaiting = context.user_data.get("awaiting")
         if awaiting:
@@ -501,10 +496,12 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     configured_ch = get_setting("channel_id").strip()
     if configured_ch and str(req.chat.id) != configured_ch:
+        logger.info("Ignoring join request from chat %s (configured: %s)", req.chat.id, configured_ch)
         return
 
     user = req.from_user
     record_user(user)
+    logger.info("Join request received from user %s in chat %s", user.id, req.chat.id)
 
     try:
         await context.bot.send_message(
@@ -512,6 +509,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=get_setting("welcome_text"),
             reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
+        logger.info("Sent auto welcome DM to user %s", user.id)
     except Exception as exc:
         logger.warning("Failed to send auto welcome DM to %s: %s", user.id, exc)
 
@@ -521,6 +519,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 chat_id=req.chat.id,
                 user_id=user.id,
             )
+            logger.info("Auto-approved join request for user %s", user.id)
         except Exception as exc:
             logger.warning("Failed to auto-approve join request for %s: %s", user.id, exc)
 
@@ -538,13 +537,19 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     new_status = cmu.new_chat_member.status
     target_user = cmu.new_chat_member.user
 
+    logger.info(
+        "Chat member status change in %s for user %s: %s -> %s",
+        cmu.chat.id,
+        getattr(target_user, "id", None),
+        old_status,
+        new_status,
+    )
+
     if old_status in ("member", "administrator", "restricted") and new_status in ("left", "kicked"):
         if not target_user or target_user.is_bot:
             return
 
-        if not is_known_user(target_user.id):
-            logger.info("User %s left without prior bot DM thread; skipping leave DM.", target_user.id)
-            return
+        record_user(target_user)
 
         try:
             await context.bot.send_message(
@@ -552,8 +557,45 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
                 text=get_setting("leave_text"),
                 reply_markup=blue_bottom_keyboard(include_rejoin=True),
             )
+            logger.info("Sent leave DM to user %s", target_user.id)
         except Exception as exc:
             logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc)
+
+
+async def start_health_server() -> asyncio.base_events.Server:
+    async def handle_client(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await reader.read(1024)
+            body = b"OK"
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+            writer.write(headers)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_client, "0.0.0.0", PORT)
+    logger.info("Health server listening on 0.0.0.0:%s", PORT)
+    return server
+
+
+async def post_init(application: Application) -> None:
+    application.bot_data["health_server"] = await start_health_server()
+
+
+async def post_shutdown(application: Application) -> None:
+    server = application.bot_data.get("health_server")
+    if server:
+        server.close()
+        await server.wait_closed()
 
 
 def main() -> None:
@@ -561,7 +603,13 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN missing in environment / .env file.")
 
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("settings", settings_command))
@@ -577,7 +625,8 @@ def main() -> None:
             "callback_query",
             "chat_join_request",
             "chat_member",
-        ]
+        ],
+        drop_pending_updates=False,
     )
 
 
