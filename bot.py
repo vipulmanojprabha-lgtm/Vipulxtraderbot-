@@ -2,7 +2,13 @@ import logging
 import os
 import sqlite3
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,27 +30,27 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "6054005253"))
+DB_PATH = "bot_data.db"
 
-# डिफ़ॉल्ट कॉन्फ़िगरेशन (ज़रूरत के अनुसार अपडेट करें)
-DEFAULT_CONFIG = {
+DEFAULT_SETTINGS = {
+    "channel_id": "",
+    "auto_approve": "off",  # "on" या "off"
     "register_url": "https://www.khelv19.com/#/register?invitationCode=89414517627",
     "panel_url": "https://example.com/panel",
+    "rejoin_url": "https://t.me/Myselfvipulkumar",
     "owner_username": "Myselfvipulkumar",
     "setup_video_url": "https://t.me/Myselfvipulkumar",
     "welcome_text": (
-        "APKA REQUEST AYA HAI DEAR ❤️\n\n"
+        "🔵 APKA REQUEST AYA HAI DEAR ❤️\n\n"
         "APKA REQUEST JALD HI ACCEPT HO JAYEGA. TAB TAK AAP NICHE DIYE GAYE "
         "REGISTRATION LINK PAR CLICK KARKE REGISTRATION KAR LO.\n\n"
-        "PANEL KAISE USE KARNA HAI, ISKE LIYE SETUP VIDEO BHI NEECHE HAI.\n"
         "AUR JALD HI LIVE AAUNGA, TO LIVE MEIN ZAROOR AANA! 🔥❤️"
     ),
     "leave_text": (
-        "Aapne channel leave kar diya hai! Agar kisi problem ya loss recovery ke liye "
-        "wapas judna chahte hain to neeche diye gaye buttons se contact ya rejoin kar sakte hain."
+        "🔵 Aapne channel leave kar diya hai! Dobara join karne ke liye neeche diye gaye "
+        "Rejoin ya Contact option par click karein."
     ),
 }
-
-DB_PATH = "bot_data.db"
 
 
 def init_db() -> None:
@@ -62,10 +68,17 @@ def init_db() -> None:
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS invite_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            label TEXT NOT NULL,
-            url TEXT NOT NULL UNIQUE
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_slots (
+            slot_num INTEGER PRIMARY KEY,
+            url TEXT NOT NULL
         )
         """
     )
@@ -80,10 +93,21 @@ def init_db() -> None:
         """
     )
 
-    for k, v in DEFAULT_CONFIG.items():
+    for k, v in DEFAULT_SETTINGS.items():
         cur.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (k, v),
+        )
+
+    cur.execute(
+        "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+        (OWNER_ID,),
+    )
+
+    for s in (1, 2, 3):
+        cur.execute(
+            "INSERT OR IGNORE INTO invite_slots (slot_num, url) VALUES (?, ?)",
+            (s, ""),
         )
 
     conn.commit()
@@ -96,7 +120,7 @@ def get_setting(key: str) -> str:
     cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = cur.fetchone()
     conn.close()
-    return row[0] if row else DEFAULT_CONFIG.get(key, "")
+    return row[0] if row else DEFAULT_SETTINGS.get(key, "")
 
 
 def set_setting(key: str, value: str) -> None:
@@ -109,6 +133,17 @@ def set_setting(key: str, value: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
 
 
 def record_user(user) -> None:
@@ -135,235 +170,390 @@ def is_known_user(user_id: int) -> bool:
     return row is not None
 
 
-def add_invite_link(label: str, url: str) -> bool:
+def get_all_slots() -> list[tuple[int, str]]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO invite_links (label, url) VALUES (?, ?)",
-            (label.strip(), url.strip()),
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-
-def get_invite_links() -> list[tuple[int, str, str]]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, label, url FROM invite_links ORDER BY id ASC")
+    cur.execute("SELECT slot_num, url FROM invite_slots ORDER BY slot_num ASC")
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def delete_invite_link(link_id: int) -> bool:
+def set_slot_url(slot_num: int, url: str) -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("DELETE FROM invite_links WHERE id = ?", (link_id,))
-    deleted = cur.rowcount > 0
+    cur.execute(
+        "INSERT INTO invite_slots (slot_num, url) VALUES (?, ?) "
+        "ON CONFLICT(slot_num) DO UPDATE SET url = excluded.url",
+        (slot_num, url.strip()),
+    )
     conn.commit()
     conn.close()
-    return deleted
 
 
-def build_action_keyboard(include_rejoin: bool = False) -> InlineKeyboardMarkup:
-    register_url = get_setting("register_url")
-    panel_url = get_setting("panel_url")
-    owner_username = get_setting("owner_username").lstrip("@")
-    setup_video_url = get_setting("setup_video_url")
+def add_new_slot() -> int:
+    slots = get_all_slots()
+    next_num = (slots[-1][0] + 1) if slots else 1
+    set_slot_url(next_num, "")
+    return next_num
 
-    chat_url = f"https://t.me/{owner_username}" if owner_username else "https://t.me/Myselfvipulkumar"
 
+def blue_bottom_keyboard(include_rejoin: bool = False) -> ReplyKeyboardMarkup:
+    owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
     rows = [
-        [InlineKeyboardButton("🔴 REGISTER NOW", url=register_url)],
-        [InlineKeyboardButton("🔥 OPEN VIPUL PANEL", url=panel_url)],
-        [InlineKeyboardButton(f"💬 CHAT WITH @{owner_username or 'Myselfvipulkumar'}", url=chat_url)],
-        [InlineKeyboardButton("🎬 WATCH SETUP VIDEO", url=setup_video_url)],
+        [KeyboardButton("🟦 REGISTER NOW"), KeyboardButton("🟦 OPEN VIP PANEL")],
+        [
+            KeyboardButton(f"🟦 CHAT WITH @{owner_username}"),
+            KeyboardButton("🟦 WATCH SETUP VIDEO"),
+        ],
     ]
-
     if include_rejoin:
-        links = get_invite_links()
-        for link_id, label, url in links[:3]:
-            rows.append([InlineKeyboardButton(f"🔁 REJOIN: {label}", url=url)])
+        rows.append([KeyboardButton("🟦 REJOIN CHANNEL")])
 
-    return InlineKeyboardMarkup(rows)
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user:
-        record_user(update.effective_user)
-
-    text = get_setting("welcome_text")
-    await update.message.reply_text(
-        text=text,
-        reply_markup=build_action_keyboard(include_rejoin=False),
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        input_field_placeholder="🔵 Blue Menu se option chunein...",
     )
 
 
-async def add_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+def settings_panel_keyboard() -> InlineKeyboardMarkup:
+    auto_state = get_setting("auto_approve").upper()
+    rows = [
+        [InlineKeyboardButton("🔵 Set Channel ID", callback_data="ask_channel_id")],
+        [InlineKeyboardButton("🔵 Set Invite Link", callback_data="menu_invite_links")],
+        [InlineKeyboardButton("🔵 Set Register Link", callback_data="ask_register_url")],
+        [InlineKeyboardButton("🔵 Set Panel Link", callback_data="ask_panel_url")],
+        [InlineKeyboardButton("🔵 Set Rejoin Link", callback_data="ask_rejoin_url")],
+        [
+            InlineKeyboardButton(
+                f"🔵 Auto Approval: {auto_state}",
+                callback_data="toggle_auto_approve",
+            )
+        ],
+        [InlineKeyboardButton("🔵 Edit Welcome Message", callback_data="ask_welcome_text")],
+        [InlineKeyboardButton("🔵 Edit Leave Message", callback_data="ask_leave_text")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def invite_slots_keyboard() -> InlineKeyboardMarkup:
+    slots = get_all_slots()
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for slot_num, url in slots:
+        badge = "✅" if url else "🔵"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{badge} Set Invite Link {slot_num}",
+                    callback_data=f"set_slot_{slot_num}",
+                )
+            ]
+        )
+
+    rows.append([InlineKeyboardButton("🔵 Add More Invite Slot", callback_data="add_slot")])
+    rows.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data="back_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_settings_status() -> str:
+    ch_id = get_setting("channel_id") or "Not Set"
+    auto_app = get_setting("auto_approve").upper()
+    reg_url = get_setting("register_url")
+    panel_url = get_setting("panel_url")
+    rejoin_url = get_setting("rejoin_url")
+    slots = get_all_slots()
+    active_slots = sum(1 for _, u in slots if u.strip())
+
+    return (
+        "🔵 **ADMIN SETTINGS CONTROL**\n\n"
+        f"• **Channel ID:** `{ch_id}`\n"
+        f"• **Auto Approval:** `{auto_app}`\n"
+        f"• **Invite Slots Set:** `{active_slots}/{len(slots)}`\n"
+        f"• **Register Link:** `{reg_url}`\n"
+        f"• **Panel Link:** `{panel_url}`\n"
+        f"• **Rejoin Link:** `{rejoin_url}`\n\n"
+        "Kisi bhi button par click karke value badlein:"
+    )
+
+
+def format_start_info(user_id: int) -> str:
+    role_text = "Admin / Owner" if is_admin(user_id) else "Member"
+    extra_tip = "\n\nSettings badalne ke liye `/settings` likh kar bhejein." if is_admin(user_id) else ""
+    return (
+        f"🔵 **VIPUL X TRADER BOT**\n\n"
+        f"• **Status:** Active\n"
+        f"• **Role:** {role_text}\n"
+        "• **Auto Approval:** "
+        f"{get_setting('auto_approve').upper()}\n\n"
+        "Neeche diye gaye **Blue Bottom Buttons** ka use karein."
+        f"{extra_tip}"
+    )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
         return
 
-    # उपयोग: /addlink VIP_Ad https://t.me/+xxxx
-    if len(context.args) < 2:
+    user = update.effective_user
+    record_user(user)
+    context.user_data.pop("awaiting", None)
+
+    await update.message.reply_text(
+        text=format_start_info(user.id),
+        parse_mode="Markdown",
+        reply_markup=blue_bottom_keyboard(include_rejoin=False),
+    )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    user = update.effective_user
+    record_user(user)
+    context.user_data.pop("awaiting", None)
+
+    if not is_admin(user.id):
         await update.message.reply_text(
-            "Istemaal:\n/addlink <Label> <Invite_URL>\n"
-            "Udaharan:\n/addlink Reel_Promo https://t.me/+AbCdEfGh123"
+            "🔵 Yeh command sirf Admin ke liye hai.",
+            reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
         return
 
-    url = context.args[-1].strip()
-    label = " ".join(context.args[:-1]).strip()
+    await update.message.reply_text(
+        text=format_settings_status(),
+        parse_mode="Markdown",
+        reply_markup=settings_panel_keyboard(),
+    )
 
-    if not (url.startswith("https://t.me/") or url.startswith("http://t.me/")):
-        await update.message.reply_text("Kripya sahi Telegram invite link (https://t.me/...) dein.")
+
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user:
         return
 
-    if add_invite_link(label, url):
-        await update.message.reply_text(f"✅ Invite link add ho gaya:\n• {label}: {url}")
-    else:
-        await update.message.reply_text("⚠️ Ye invite link pehle se add hai.")
+    await query.answer()
 
-
-async def links_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("🔵 Yeh panel sirf Admin ke liye hai.")
         return
 
-    links = get_invite_links()
-    if not links:
-        await update.message.reply_text("Abhi koi invite link add nahi hai. /addlink se add karein.")
+    data = query.data or ""
+
+    if data == "back_settings":
+        context.user_data.pop("awaiting", None)
+        await query.edit_message_text(
+            text=format_settings_status(),
+            parse_mode="Markdown",
+            reply_markup=settings_panel_keyboard(),
+        )
         return
 
-    lines = ["📋 Saved Invite Links:\n"]
-    for link_id, label, url in links:
-        lines.append(f"{link_id}. {label} -> {url}")
-    lines.append("\nDelete karne ke liye: /dellink <ID>")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def del_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+    if data == "menu_invite_links":
+        slots = get_all_slots()
+        lines = ["🔵 **SET INVITE LINK MENU**\n"]
+        for slot_num, url in slots:
+            lines.append(f"• Slot {slot_num}: {url if url else '_Khali_'}")
+        lines.append("\nKisi bhi button par click karke link bhejein:")
+        await query.edit_message_text(
+            text="\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=invite_slots_keyboard(),
+        )
         return
 
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Istemaal: /dellink <ID>")
+    if data == "add_slot":
+        new_num = add_new_slot()
+        slots = get_all_slots()
+        lines = [f"✅ Naya slot **Set Invite Link {new_num}** add ho gaya!\n"]
+        for slot_num, url in slots:
+            lines.append(f"• Slot {slot_num}: {url if url else '_Khali_'}")
+        await query.edit_message_text(
+            text="\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=invite_slots_keyboard(),
+        )
         return
 
-    link_id = int(context.args[0])
-    if delete_invite_link(link_id):
-        await update.message.reply_text(f"🗑️ Link ID {link_id} delete ho gaya.")
-    else:
-        await update.message.reply_text("❌ Is ID ka koi link nahi mila.")
-
-
-async def set_video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+    if data.startswith("set_slot_"):
+        slot_num = int(data.replace("set_slot_", ""))
+        context.user_data["awaiting"] = f"invite_slot:{slot_num}"
+        await query.edit_message_text(
+            text=(
+                f"🔵 **Set Invite Link {slot_num}** ke liye naya Telegram invite link bhejein "
+                "(jaise `https://t.me/+AbCdEfGh123`):"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Cancel", callback_data="menu_invite_links")]]
+            ),
+        )
         return
 
-    if not context.args:
-        await update.message.reply_text("Istemaal: /setvideo <Video_URL_or_t.me_Link>")
+    if data == "toggle_auto_approve":
+        current = get_setting("auto_approve")
+        new_val = "on" if current != "on" else "off"
+        set_setting("auto_approve", new_val)
+        await query.edit_message_text(
+            text=format_settings_status(),
+            parse_mode="Markdown",
+            reply_markup=settings_panel_keyboard(),
+        )
         return
 
-    video_url = context.args[0].strip()
-    set_setting("setup_video_url", video_url)
-    await update.message.reply_text(f"✅ Setup video link update ho gaya:\n{video_url}")
+    prompts = {
+        "ask_channel_id": (
+            "channel_id",
+            "🔵 Apne main channel ki **Channel ID** bhejein (jaise `-1001234567890`):",
+        ),
+        "ask_register_url": ("register_url", "🔵 Naya **Register Link** bhejein:"),
+        "ask_panel_url": ("panel_url", "🔵 Naya **Panel Link** bhejein:"),
+        "ask_rejoin_url": ("rejoin_url", "🔵 Naya **Rejoin Link** bhejein:"),
+        "ask_welcome_text": ("welcome_text", "🔵 Naya **Welcome Message** likh kar bhejein:"),
+        "ask_leave_text": ("leave_text", "🔵 Naya **Leave Message** likh kar bhejein:"),
+    }
+
+    if data in prompts:
+        key_name, prompt_msg = prompts[data]
+        context.user_data["awaiting"] = f"setting:{key_name}"
+        await query.edit_message_text(
+            text=prompt_msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back to Settings", callback_data="back_settings")]]
+            ),
+        )
 
 
-async def set_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
         return
 
-    if not context.args:
-        await update.message.reply_text("Istemaal: /setpanel <Panel_URL>")
+    user = update.effective_user
+    record_user(user)
+    text_val = (update.message.text or "").strip()
+    if not text_val:
         return
 
-    panel_url = context.args[0].strip()
-    set_setting("panel_url", panel_url)
-    await update.message.reply_text(f"✅ Panel link update ho gaya:\n{panel_url}")
+    # पहले Admin/Owner की पेंडिंग सेटिंग इनपुट जांचें
+    if is_admin(user.id):
+        awaiting = context.user_data.get("awaiting")
+        if awaiting:
+            if awaiting.startswith("invite_slot:"):
+                slot_num = int(awaiting.split(":", 1)[1])
+                set_slot_url(slot_num, text_val)
+                context.user_data.pop("awaiting", None)
+                await update.message.reply_text(
+                    f"✅ **Set Invite Link {slot_num}** save ho gaya:\n`{text_val}`",
+                    parse_mode="Markdown",
+                    reply_markup=invite_slots_keyboard(),
+                )
+                return
+
+            if awaiting.startswith("setting:"):
+                key_name = awaiting.split(":", 1)[1]
+                set_setting(key_name, text_val)
+                context.user_data.pop("awaiting", None)
+                await update.message.reply_text(
+                    f"✅ `{key_name}` update ho gaya!",
+                    parse_mode="Markdown",
+                    reply_markup=settings_panel_keyboard(),
+                )
+                return
+
+    owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
+
+    if text_val == "🟦 REGISTER NOW":
+        await update.message.reply_text(
+            f"🔵 **REGISTER NOW**\n{get_setting('register_url')}",
+            parse_mode="Markdown",
+            reply_markup=blue_bottom_keyboard(),
+        )
+    elif text_val == "🟦 OPEN VIP PANEL":
+        await update.message.reply_text(
+            f"🔵 **OPEN VIP PANEL**\n{get_setting('panel_url')}",
+            parse_mode="Markdown",
+            reply_markup=blue_bottom_keyboard(),
+        )
+    elif text_val == f"🟦 CHAT WITH @{owner_username}":
+        await update.message.reply_text(
+            f"🔵 **CHAT WITH ME**\nhttps://t.me/{owner_username}",
+            reply_markup=blue_bottom_keyboard(),
+        )
+    elif text_val == "🟦 WATCH SETUP VIDEO":
+        await update.message.reply_text(
+            f"🔵 **WATCH SETUP VIDEO**\n{get_setting('setup_video_url')}",
+            reply_markup=blue_bottom_keyboard(),
+        )
+    elif text_val == "🟦 REJOIN CHANNEL":
+        await update.message.reply_text(
+            f"🔵 **REJOIN CHANNEL**\n{get_setting('rejoin_url')}",
+            reply_markup=blue_bottom_keyboard(include_rejoin=True),
+        )
 
 
-async def set_register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Istemaal: /setregister <Register_URL>")
-        return
-
-    reg_url = context.args[0].strip()
-    set_setting("register_url", reg_url)
-    await update.message.reply_text(f"✅ Register link update ho gaya:\n{reg_url}")
-
-
-async def set_username_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Istemaal: /setusername Myselfvipulkumar")
-        return
-
-    uname = context.args[0].strip().lstrip("@")
-    set_setting("owner_username", uname)
-    await update.message.reply_text(f"✅ Chat username set ho gaya: @{uname}")
-
-
-async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     req = update.chat_join_request
     if not req or not req.from_user:
+        return
+
+    configured_ch = get_setting("channel_id").strip()
+    if configured_ch and str(req.chat.id) != configured_ch:
         return
 
     user = req.from_user
     record_user(user)
 
-    invite_url = req.invite_link.invite_link if req.invite_link else "N/A"
-    logger.info("Join request from %s (%s) via %s", user.id, user.full_name, invite_url)
-
     try:
         await context.bot.send_message(
             chat_id=user.id,
             text=get_setting("welcome_text"),
-            reply_markup=build_action_keyboard(include_rejoin=False),
+            reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
     except Exception as exc:
-        logger.warning("Could not send join DM to %s: %s", user.id, exc)
+        logger.warning("Failed to send auto welcome DM to %s: %s", user.id, exc)
+
+    if get_setting("auto_approve") == "on":
+        try:
+            await context.bot.approve_chat_join_request(
+                chat_id=req.chat.id,
+                user_id=user.id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to auto-approve join request for %s: %s", user.id, exc)
 
 
-async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cmu = update.chat_member
-    if not cmu or not cmu.from_user:
+    if not cmu:
+        return
+
+    configured_ch = get_setting("channel_id").strip()
+    if configured_ch and str(cmu.chat.id) != configured_ch:
         return
 
     old_status = cmu.old_chat_member.status
     new_status = cmu.new_chat_member.status
     target_user = cmu.new_chat_member.user
 
-    # जब कोई member चैनल छोड़ता है या हटाया जाता है
     if old_status in ("member", "administrator", "restricted") and new_status in ("left", "kicked"):
         if not target_user or target_user.is_bot:
             return
 
         if not is_known_user(target_user.id):
-            logger.info("User %s left channel without prior bot interaction; DM skipped.", target_user.id)
+            logger.info("User %s left without prior bot DM thread; skipping leave DM.", target_user.id)
             return
 
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
                 text=get_setting("leave_text"),
-                reply_markup=build_action_keyboard(include_rejoin=True),
+                reply_markup=blue_bottom_keyboard(include_rejoin=True),
             )
         except Exception as exc:
-            logger.warning("Could not send leave DM to %s: %s", target_user.id, exc)
-
-
-async def track_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user:
-        record_user(update.effective_user)
+            logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc)
 
 
 def main() -> None:
@@ -371,21 +561,15 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN missing in environment / .env file.")
 
     init_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("addlink", add_link_cmd))
-    app.add_handler(CommandHandler("links", links_cmd))
-    app.add_handler(CommandHandler("dellink", del_link_cmd))
-    app.add_handler(CommandHandler("setvideo", set_video_cmd))
-    app.add_handler(CommandHandler("setpanel", set_panel_cmd))
-    app.add_handler(CommandHandler("setregister", set_register_cmd))
-    app.add_handler(CommandHandler("setusername", set_username_cmd))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bottom_or_text))
 
-    app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_any_message))
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     app.run_polling(
         allowed_updates=[
