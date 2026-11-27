@@ -258,6 +258,7 @@ def settings_panel_keyboard() -> InlineKeyboardMarkup:
     auto_state = get_setting("auto_approve").upper()
     rows = [
         [InlineKeyboardButton("🔵 Set Channel ID", callback_data="ask_channel_id")],
+        [InlineKeyboardButton("🔵 Clear Channel Filter (All Channels)", callback_data="clear_channel_id")],
         [InlineKeyboardButton("🔵 Set Invite Link", callback_data="menu_invite_links")],
         [InlineKeyboardButton("🔵 Set Register Link", callback_data="ask_register_url")],
         [InlineKeyboardButton("🔵 Set Panel Link", callback_data="ask_panel_url")],
@@ -295,7 +296,7 @@ def invite_slots_keyboard() -> InlineKeyboardMarkup:
 
 
 def format_settings_status() -> str:
-    ch_id = get_setting("channel_id") or "Not Set"
+    ch_id = get_setting("channel_id") or "All Channels (No Filter)"
     auto_app = get_setting("auto_approve").upper()
     reg_url = get_setting("register_url")
     panel_url = get_setting("panel_url")
@@ -383,6 +384,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data or ""
 
     if data == "back_settings":
+        context.user_data.pop("awaiting", None)
+        await query.edit_message_text(
+            text=format_settings_status(),
+            parse_mode="Markdown",
+            reply_markup=settings_panel_keyboard(),
+        )
+        return
+
+    if data == "clear_channel_id":
+        set_setting("channel_id", "")
         context.user_data.pop("awaiting", None)
         await query.edit_message_text(
             text=format_settings_status(),
@@ -535,16 +546,21 @@ async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def notify_admins_member_left(
-    context: ContextTypes.DEFAULT_TYPE, user, chat_title: str, chat_id: int
+    context: ContextTypes.DEFAULT_TYPE, user, chat_title: str, chat_id: int, dm_status: str
 ) -> None:
     username_str = f"@{user.username}" if getattr(user, "username", None) else "No Username"
-    full_name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or "User"
+    full_name = (
+        getattr(user, "full_name", None)
+        or getattr(user, "first_name", None)
+        or "User"
+    )
     alert_text = (
         "🔴 **MEMBER LEFT CHANNEL**\n\n"
         f"• **Name:** {full_name}\n"
         f"• **Username:** {username_str}\n"
         f"• **User ID:** `{user.id}`\n"
-        f"• **Channel:** {chat_title} (`{chat_id}`)"
+        f"• **Channel:** {chat_title} (`{chat_id}`)\n"
+        f"• **Leave DM:** {dm_status}"
     )
 
     for admin_id in get_all_admin_ids():
@@ -643,9 +659,9 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     ):
         logger.info("Member left chat %s: user %s", cmu.chat.id, target_user.id)
         chat_title = cmu.chat.title or "Channel"
-        await notify_admins_member_left(context, target_user, chat_title, cmu.chat.id)
 
         leave_msg = build_leave_message()
+        dm_status = "Sent ✅"
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
@@ -653,7 +669,10 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=blue_bottom_keyboard(include_rejoin=True),
             )
         except TelegramError as exc:
+            dm_status = f"Failed ❌ ({exc.message})"
             logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc.message)
+
+        await notify_admins_member_left(context, target_user, chat_title, cmu.chat.id, dm_status)
 
 
 async def start_health_server() -> asyncio.base_events.Server:
@@ -683,6 +702,10 @@ async def start_health_server() -> asyncio.base_events.Server:
 
 async def post_init(application: Application) -> None:
     application.bot_data["health_server"] = await start_health_server()
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+    except TelegramError:
+        pass
 
 
 async def post_shutdown(application: Application) -> None:
