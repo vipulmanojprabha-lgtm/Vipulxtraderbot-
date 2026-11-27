@@ -10,7 +10,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -175,6 +175,15 @@ def record_user(user) -> None:
     conn.close()
 
 
+def is_known_user(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM known_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def get_all_slots() -> list[tuple[int, str]]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -182,6 +191,13 @@ def get_all_slots() -> list[tuple[int, str]]:
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def get_primary_invite_link() -> str:
+    for _, url in get_all_slots():
+        if url.strip():
+            return url.strip()
+    return get_setting("rejoin_url")
 
 
 def set_slot_url(slot_num: int, url: str) -> None:
@@ -226,15 +242,15 @@ def build_welcome_message() -> str:
     reg_url = get_setting("register_url")
     panel_url = get_setting("panel_url")
     owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
-    rejoin_url = get_setting("rejoin_url")
+    invite_url = get_primary_invite_link()
     header_text = get_setting("welcome_text")
 
     return (
         f"{header_text}\n\n"
+        f"📢 Join Channel Link:\n{invite_url}\n\n"
         f"🔴 Register Link:\n{reg_url}\n\n"
         f"🔥 VIP Panel Link:\n{panel_url}\n\n"
-        f"💬 Chat Link:\nhttps://t.me/{owner_username}\n\n"
-        f"🔁 Channel Link:\n{rejoin_url}"
+        f"💬 Chat Link:\nhttps://t.me/{owner_username}"
     )
 
 
@@ -258,7 +274,11 @@ def settings_panel_keyboard() -> InlineKeyboardMarkup:
     auto_state = get_setting("auto_approve").upper()
     rows = [
         [InlineKeyboardButton("🔵 Set Channel ID", callback_data="ask_channel_id")],
-        [InlineKeyboardButton("🔵 Clear Channel Filter (All Channels)", callback_data="clear_channel_id")],
+        [
+            InlineKeyboardButton(
+                "🔵 Clear Channel Filter (All Channels)", callback_data="clear_channel_id"
+            )
+        ],
         [InlineKeyboardButton("🔵 Set Invite Link", callback_data="menu_invite_links")],
         [InlineKeyboardButton("🔵 Set Register Link", callback_data="ask_register_url")],
         [InlineKeyboardButton("🔵 Set Panel Link", callback_data="ask_panel_url")],
@@ -316,20 +336,13 @@ def format_settings_status() -> str:
     )
 
 
-def format_start_info(user_id: int) -> str:
-    role_text = "Admin / Owner" if is_admin(user_id) else "Member"
-    extra_tip = (
-        "\n\nSettings badalne ke liye `/settings` likh kar bhejein."
-        if is_admin(user_id)
-        else ""
-    )
+def format_admin_start_info(bot_username: str) -> str:
     return (
-        "🔵 **VIPUL X TRADER BOT**\n\n"
-        "• **Status:** Active\n"
-        f"• **Role:** {role_text}\n"
-        f"• **Auto Approval:** {get_setting('auto_approve').upper()}\n\n"
-        "Neeche diye gaye **Blue Bottom Buttons** ka use karein."
-        f"{extra_tip}"
+        "🔵 **VIPUL X TRADER BOT (ADMIN)**\n\n"
+        f"• **Status:** Active\n"
+        f"• **Auto Approval:** {get_setting('auto_approve').upper()}\n"
+        f"• **User Funnel Link:** `https://t.me/{bot_username}?start=vip`\n\n"
+        "Settings badalne ke liye `/settings` likh kar bhejein."
     )
 
 
@@ -341,9 +354,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     record_user(user)
     context.user_data.pop("awaiting", None)
 
+    if is_admin(user.id):
+        bot_username = context.bot.username or "YourBot"
+        await update.message.reply_text(
+            text=format_admin_start_info(bot_username),
+            parse_mode="Markdown",
+            reply_markup=blue_bottom_keyboard(include_rejoin=False),
+        )
+        return
+
+    # Normal user jab /start ya ?start=vip se aaye to turant Welcome + Channel + Panel links bhejein
     await update.message.reply_text(
-        text=format_start_info(user.id),
-        parse_mode="Markdown",
+        text=build_welcome_message(),
         reply_markup=blue_bottom_keyboard(include_rejoin=False),
     )
 
@@ -560,7 +582,7 @@ async def notify_admins_member_left(
         f"• **Username:** {username_str}\n"
         f"• **User ID:** `{user.id}`\n"
         f"• **Channel:** {chat_title} (`{chat_id}`)\n"
-        f"• **Leave DM:** {dm_status}"
+        f"• **User DM:** {dm_status}"
     )
 
     for admin_id in get_all_admin_ids():
@@ -581,20 +603,11 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     configured_ch = get_setting("channel_id").strip()
     if configured_ch and str(req.chat.id) != configured_ch:
-        logger.info(
-            "Join request chat %s does not match configured channel_id %s",
-            req.chat.id,
-            configured_ch,
-        )
         return
 
     user = req.from_user
-    record_user(user)
-    logger.info("Join request received from user %s in chat %s", user.id, req.chat.id)
-
     welcome_msg = build_welcome_message()
-    dm_sent = False
-    dm_error = ""
+    dm_status = "Sent ✅"
 
     try:
         await context.bot.send_message(
@@ -602,21 +615,20 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=welcome_msg,
             reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
-        dm_sent = True
-        logger.info("Welcome DM sent to join-request user %s", user.id)
+        record_user(user)
+    except Forbidden:
+        dm_status = "Not Started Bot (User must tap Start first)"
     except TelegramError as exc:
-        dm_error = exc.message
-        logger.warning("Welcome DM failed for join-request user %s: %s", user.id, exc.message)
+        dm_status = f"Failed ({exc.message})"
 
     try:
-        status_line = "Sent ✅" if dm_sent else f"Failed ❌ ({dm_error})"
         await context.bot.send_message(
             chat_id=OWNER_ID,
             text=(
                 "🟢 **NEW JOIN REQUEST**\n\n"
                 f"• **User:** {user.full_name} (`{user.id}`)\n"
                 f"• **Channel:** {req.chat.title or 'Channel'} (`{req.chat.id}`)\n"
-                f"• **Welcome DM:** {status_line}"
+                f"• **Welcome DM:** {dm_status}"
             ),
             parse_mode="Markdown",
         )
@@ -629,7 +641,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 chat_id=req.chat.id,
                 user_id=user.id,
             )
-            logger.info("Auto-approved join request for user %s", user.id)
         except TelegramError as exc:
             logger.warning("Failed to auto-approve join request for %s: %s", user.id, exc.message)
 
@@ -650,29 +661,28 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     if not target_user or target_user.is_bot:
         return
 
-    record_user(target_user)
-
-    # Sirf member leave hone par
     if old_status in ("member", "administrator", "restricted") and new_status in (
         "left",
         "kicked",
     ):
-        logger.info("Member left chat %s: user %s", cmu.chat.id, target_user.id)
         chat_title = cmu.chat.title or "Channel"
-
         leave_msg = build_leave_message()
-        dm_status = "Sent ✅"
+
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
                 text=leave_msg,
                 reply_markup=blue_bottom_keyboard(include_rejoin=True),
             )
+            dm_status = "Sent ✅"
+        except Forbidden:
+            dm_status = "Not Started Bot (User must tap Start first)"
         except TelegramError as exc:
-            dm_status = f"Failed ❌ ({exc.message})"
-            logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc.message)
+            dm_status = f"Failed ({exc.message})"
 
-        await notify_admins_member_left(context, target_user, chat_title, cmu.chat.id, dm_status)
+        await notify_admins_member_left(
+            context, target_user, chat_title, cmu.chat.id, dm_status
+        )
 
 
 async def start_health_server() -> asyncio.base_events.Server:
