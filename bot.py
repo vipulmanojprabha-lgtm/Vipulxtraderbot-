@@ -46,12 +46,12 @@ DEFAULT_SETTINGS = {
     "welcome_text": (
         "🔵 APKA REQUEST AYA HAI DEAR ❤️\n\n"
         "APKA REQUEST JALD HI ACCEPT HO JAYEGA. TAB TAK AAP NICHE DIYE GAYE "
-        "REGISTRATION LINK PAR CLICK KARKE REGISTRATION KAR LO.\n\n"
+        "BUTTONS PAR CLICK KARKE REGISTER AUR PANEL OPEN KAR LO.\n\n"
         "AUR JALD HI LIVE AAUNGA, TO LIVE MEIN ZAROOR AANA! 🔥❤️"
     ),
     "leave_text": (
         "🔵 Aapne channel leave kar diya hai! Dobara join karne ke liye neeche diye gaye "
-        "Rejoin ya Contact option par click karein."
+        "buttons ka use karein."
     ),
 }
 
@@ -175,15 +175,6 @@ def record_user(user) -> None:
     conn.close()
 
 
-def is_known_user(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM known_users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
 def get_all_slots() -> list[tuple[int, str]]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -238,36 +229,25 @@ def blue_bottom_keyboard(include_rejoin: bool = False) -> ReplyKeyboardMarkup:
     )
 
 
-def build_welcome_message() -> str:
+def link_buttons_keyboard(include_rejoin: bool = False) -> InlineKeyboardMarkup:
     reg_url = get_setting("register_url")
     panel_url = get_setting("panel_url")
     owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
-    invite_url = get_primary_invite_link()
-    header_text = get_setting("welcome_text")
-
-    return (
-        f"{header_text}\n\n"
-        f"📢 Join Channel Link:\n{invite_url}\n\n"
-        f"🔴 Register Link:\n{reg_url}\n\n"
-        f"🔥 VIP Panel Link:\n{panel_url}\n\n"
-        f"💬 Chat Link:\nhttps://t.me/{owner_username}"
-    )
-
-
-def build_leave_message() -> str:
-    reg_url = get_setting("register_url")
-    panel_url = get_setting("panel_url")
-    owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
+    chat_url = f"https://t.me/{owner_username}"
+    channel_url = get_primary_invite_link()
     rejoin_url = get_setting("rejoin_url")
-    header_text = get_setting("leave_text")
 
-    return (
-        f"{header_text}\n\n"
-        f"🔁 Rejoin Link:\n{rejoin_url}\n\n"
-        f"🔴 Register Link:\n{reg_url}\n\n"
-        f"🔥 VIP Panel Link:\n{panel_url}\n\n"
-        f"💬 Chat Link:\nhttps://t.me/{owner_username}"
-    )
+    rows = [
+        [InlineKeyboardButton("🔴 REGISTER LINK", url=reg_url)],
+        [InlineKeyboardButton("🔥 VIP PANEL LINK", url=panel_url)],
+        [InlineKeyboardButton("💬 CHAT LINK", url=chat_url)],
+        [InlineKeyboardButton("📢 CHANNEL LINK", url=channel_url)],
+    ]
+
+    if include_rejoin:
+        rows.append([InlineKeyboardButton("🔁 REJOIN CHANNEL", url=rejoin_url)])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def settings_panel_keyboard() -> InlineKeyboardMarkup:
@@ -363,10 +343,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Normal user jab /start ya ?start=vip se aaye to turant Welcome + Channel + Panel links bhejein
     await update.message.reply_text(
-        text=build_welcome_message(),
-        reply_markup=blue_bottom_keyboard(include_rejoin=False),
+        text=get_setting("welcome_text"),
+        reply_markup=link_buttons_keyboard(include_rejoin=False),
     )
 
 
@@ -606,14 +585,13 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     user = req.from_user
-    welcome_msg = build_welcome_message()
     dm_status = "Sent ✅"
 
     try:
         await context.bot.send_message(
             chat_id=user.id,
-            text=welcome_msg,
-            reply_markup=blue_bottom_keyboard(include_rejoin=False),
+            text=get_setting("welcome_text"),
+            reply_markup=link_buttons_keyboard(include_rejoin=False),
         )
         record_user(user)
     except Forbidden:
@@ -666,13 +644,12 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         "kicked",
     ):
         chat_title = cmu.chat.title or "Channel"
-        leave_msg = build_leave_message()
 
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
-                text=leave_msg,
-                reply_markup=blue_bottom_keyboard(include_rejoin=True),
+                text=get_setting("leave_text"),
+                reply_markup=link_buttons_keyboard(include_rejoin=True),
             )
             dm_status = "Sent ✅"
         except Forbidden:
