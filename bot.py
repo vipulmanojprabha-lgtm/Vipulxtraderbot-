@@ -222,18 +222,35 @@ def blue_bottom_keyboard(include_rejoin: bool = False) -> ReplyKeyboardMarkup:
     )
 
 
-def build_links_message(header_text: str) -> str:
+def build_welcome_message() -> str:
     reg_url = get_setting("register_url")
     panel_url = get_setting("panel_url")
     owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
     rejoin_url = get_setting("rejoin_url")
+    header_text = get_setting("welcome_text")
 
     return (
         f"{header_text}\n\n"
         f"🔴 Register Link:\n{reg_url}\n\n"
         f"🔥 VIP Panel Link:\n{panel_url}\n\n"
         f"💬 Chat Link:\nhttps://t.me/{owner_username}\n\n"
-        f"🔁 Channel / Rejoin Link:\n{rejoin_url}"
+        f"🔁 Channel Link:\n{rejoin_url}"
+    )
+
+
+def build_leave_message() -> str:
+    reg_url = get_setting("register_url")
+    panel_url = get_setting("panel_url")
+    owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
+    rejoin_url = get_setting("rejoin_url")
+    header_text = get_setting("leave_text")
+
+    return (
+        f"{header_text}\n\n"
+        f"🔁 Rejoin Link:\n{rejoin_url}\n\n"
+        f"🔴 Register Link:\n{reg_url}\n\n"
+        f"🔥 VIP Panel Link:\n{panel_url}\n\n"
+        f"💬 Chat Link:\nhttps://t.me/{owner_username}"
     )
 
 
@@ -517,7 +534,9 @@ async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-async def notify_admins_member_left(context: ContextTypes.DEFAULT_TYPE, user, chat_title: str, chat_id: int) -> None:
+async def notify_admins_member_left(
+    context: ContextTypes.DEFAULT_TYPE, user, chat_title: str, chat_id: int
+) -> None:
     username_str = f"@{user.username}" if getattr(user, "username", None) else "No Username"
     full_name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or "User"
     alert_text = (
@@ -546,22 +565,47 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     configured_ch = get_setting("channel_id").strip()
     if configured_ch and str(req.chat.id) != configured_ch:
+        logger.info(
+            "Join request chat %s does not match configured channel_id %s",
+            req.chat.id,
+            configured_ch,
+        )
         return
 
     user = req.from_user
     record_user(user)
     logger.info("Join request received from user %s in chat %s", user.id, req.chat.id)
 
-    welcome_msg = build_links_message(get_setting("welcome_text"))
+    welcome_msg = build_welcome_message()
+    dm_sent = False
+    dm_error = ""
+
     try:
         await context.bot.send_message(
             chat_id=user.id,
             text=welcome_msg,
             reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
-        logger.info("Sent auto welcome DM to user %s", user.id)
+        dm_sent = True
+        logger.info("Welcome DM sent to join-request user %s", user.id)
     except TelegramError as exc:
-        logger.warning("Failed to send welcome DM to %s: %s", user.id, exc.message)
+        dm_error = exc.message
+        logger.warning("Welcome DM failed for join-request user %s: %s", user.id, exc.message)
+
+    try:
+        status_line = "Sent ✅" if dm_sent else f"Failed ❌ ({dm_error})"
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "🟢 **NEW JOIN REQUEST**\n\n"
+                f"• **User:** {user.full_name} (`{user.id}`)\n"
+                f"• **Channel:** {req.chat.title or 'Channel'} (`{req.chat.id}`)\n"
+                f"• **Welcome DM:** {status_line}"
+            ),
+            parse_mode="Markdown",
+        )
+    except TelegramError:
+        pass
 
     if get_setting("auto_approve") == "on":
         try:
@@ -592,7 +636,7 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
     record_user(target_user)
 
-    # Sirf member leave hone par (join hone par kuch nahi bhejna)
+    # Sirf member leave hone par
     if old_status in ("member", "administrator", "restricted") and new_status in (
         "left",
         "kicked",
@@ -601,7 +645,7 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         chat_title = cmu.chat.title or "Channel"
         await notify_admins_member_left(context, target_user, chat_title, cmu.chat.id)
 
-        leave_msg = build_links_message(get_setting("leave_text"))
+        leave_msg = build_leave_message()
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
@@ -661,12 +705,11 @@ def main() -> None:
         .build()
     )
 
+    app.add_handler(ChatJoinRequestHandler(on_join_request), group=-1)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(handle_callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bottom_or_text))
-
-    app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(
         ChatMemberHandler(on_chat_member_update, ChatMemberHandler.ANY_CHAT_MEMBER)
     )
