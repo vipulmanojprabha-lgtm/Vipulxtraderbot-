@@ -10,6 +10,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -148,6 +149,17 @@ def is_admin(user_id: int) -> bool:
     return row is not None
 
 
+def get_all_admin_ids() -> list[int]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM admins")
+    rows = [int(r[0]) for r in cur.fetchall()]
+    conn.close()
+    if OWNER_ID not in rows:
+        rows.append(OWNER_ID)
+    return rows
+
+
 def record_user(user) -> None:
     if not user:
         return
@@ -207,6 +219,21 @@ def blue_bottom_keyboard(include_rejoin: bool = False) -> ReplyKeyboardMarkup:
         rows,
         resize_keyboard=True,
         input_field_placeholder="🔵 Blue Menu se option chunein...",
+    )
+
+
+def build_links_message(header_text: str) -> str:
+    reg_url = get_setting("register_url")
+    panel_url = get_setting("panel_url")
+    owner_username = get_setting("owner_username").lstrip("@") or "Myselfvipulkumar"
+    rejoin_url = get_setting("rejoin_url")
+
+    return (
+        f"{header_text}\n\n"
+        f"🔴 Register Link:\n{reg_url}\n\n"
+        f"🔥 VIP Panel Link:\n{panel_url}\n\n"
+        f"💬 Chat Link:\nhttps://t.me/{owner_username}\n\n"
+        f"🔁 Channel / Rejoin Link:\n{rejoin_url}"
     )
 
 
@@ -480,6 +507,7 @@ async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TY
     elif text_val == "🟦 WATCH SETUP VIDEO":
         await update.message.reply_text(
             f"🔵 **WATCH SETUP VIDEO**\n{get_setting('setup_video_url')}",
+            parse_mode="Markdown",
             reply_markup=blue_bottom_keyboard(),
         )
     elif text_val == "🟦 REJOIN CHANNEL":
@@ -489,6 +517,28 @@ async def handle_bottom_or_text(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+async def notify_admins_member_left(context: ContextTypes.DEFAULT_TYPE, user, chat_title: str, chat_id: int) -> None:
+    username_str = f"@{user.username}" if getattr(user, "username", None) else "No Username"
+    full_name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or "User"
+    alert_text = (
+        "🔴 **MEMBER LEFT CHANNEL**\n\n"
+        f"• **Name:** {full_name}\n"
+        f"• **Username:** {username_str}\n"
+        f"• **User ID:** `{user.id}`\n"
+        f"• **Channel:** {chat_title} (`{chat_id}`)"
+    )
+
+    for admin_id in get_all_admin_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=alert_text,
+                parse_mode="Markdown",
+            )
+        except TelegramError as exc:
+            logger.warning("Failed to send leave alert to admin %s: %s", admin_id, exc.message)
+
+
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     req = update.chat_join_request
     if not req or not req.from_user:
@@ -496,22 +546,22 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     configured_ch = get_setting("channel_id").strip()
     if configured_ch and str(req.chat.id) != configured_ch:
-        logger.info("Ignoring join request from chat %s (configured: %s)", req.chat.id, configured_ch)
         return
 
     user = req.from_user
     record_user(user)
     logger.info("Join request received from user %s in chat %s", user.id, req.chat.id)
 
+    welcome_msg = build_links_message(get_setting("welcome_text"))
     try:
         await context.bot.send_message(
             chat_id=user.id,
-            text=get_setting("welcome_text"),
+            text=welcome_msg,
             reply_markup=blue_bottom_keyboard(include_rejoin=False),
         )
         logger.info("Sent auto welcome DM to user %s", user.id)
-    except Exception as exc:
-        logger.warning("Failed to send auto welcome DM to %s: %s", user.id, exc)
+    except TelegramError as exc:
+        logger.warning("Failed to send welcome DM to %s: %s", user.id, exc.message)
 
     if get_setting("auto_approve") == "on":
         try:
@@ -520,8 +570,8 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 user_id=user.id,
             )
             logger.info("Auto-approved join request for user %s", user.id)
-        except Exception as exc:
-            logger.warning("Failed to auto-approve join request for %s: %s", user.id, exc)
+        except TelegramError as exc:
+            logger.warning("Failed to auto-approve join request for %s: %s", user.id, exc.message)
 
 
 async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -537,29 +587,29 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     new_status = cmu.new_chat_member.status
     target_user = cmu.new_chat_member.user
 
-    logger.info(
-        "Chat member status change in %s for user %s: %s -> %s",
-        cmu.chat.id,
-        getattr(target_user, "id", None),
-        old_status,
-        new_status,
-    )
+    if not target_user or target_user.is_bot:
+        return
 
-    if old_status in ("member", "administrator", "restricted") and new_status in ("left", "kicked"):
-        if not target_user or target_user.is_bot:
-            return
+    record_user(target_user)
 
-        record_user(target_user)
+    # Sirf member leave hone par (join hone par kuch nahi bhejna)
+    if old_status in ("member", "administrator", "restricted") and new_status in (
+        "left",
+        "kicked",
+    ):
+        logger.info("Member left chat %s: user %s", cmu.chat.id, target_user.id)
+        chat_title = cmu.chat.title or "Channel"
+        await notify_admins_member_left(context, target_user, chat_title, cmu.chat.id)
 
+        leave_msg = build_links_message(get_setting("leave_text"))
         try:
             await context.bot.send_message(
                 chat_id=target_user.id,
-                text=get_setting("leave_text"),
+                text=leave_msg,
                 reply_markup=blue_bottom_keyboard(include_rejoin=True),
             )
-            logger.info("Sent leave DM to user %s", target_user.id)
-        except Exception as exc:
-            logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc)
+        except TelegramError as exc:
+            logger.warning("Failed to send leave DM to %s: %s", target_user.id, exc.message)
 
 
 async def start_health_server() -> asyncio.base_events.Server:
@@ -617,7 +667,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bottom_or_text))
 
     app.add_handler(ChatJoinRequestHandler(on_join_request))
-    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(
+        ChatMemberHandler(on_chat_member_update, ChatMemberHandler.ANY_CHAT_MEMBER)
+    )
 
     app.run_polling(
         allowed_updates=[
